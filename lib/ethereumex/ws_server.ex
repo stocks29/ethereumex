@@ -13,7 +13,7 @@ defmodule Ethereumex.WsServer do
 
     def start_link(url, parent) do
       Logger.debug("websocket server starting with url: #{url}")
-      WebSockex.start_link(url, __MODULE__, parent)
+      WebSockex.start_link(url, __MODULE__, parent, handle_initial_conn_failure: true)
     end
 
     def send_request(socket, request) do
@@ -26,13 +26,33 @@ defmodule Ethereumex.WsServer do
       {:ok, parent}
     end
 
+    def handle_connect(_conn, parent) do
+      send(parent, :socket_connected)
+      {:ok, parent}
+    end
+
+    def handle_disconnect(%{reason: {_, :normal}}, state) do
+      Logger.debug("socket closing normally")
+      {:ok, state}
+    end
+    def handle_disconnect(%{attempt_number: attempts}, state) do
+      # attempt to reconnect
+      if attempts > 3 do
+        # still failing after 3 attempts. backoff a little
+        # TODO: propertize these params
+        :timer.sleep(max(100 * attempts, 1_000))
+      end
+      Logger.debug("socket disconnected. attempting to reconnect")
+      {:reconnect, state}
+    end
   end
 
   defmodule State do
     defstruct socket: nil,
               replies: %{},
               subs: %{},
-              pending_subs: %{}
+              pending_subs: %{},
+              sub_params: %{}
 
     def new(socket), do: %__MODULE__{socket: socket}
 
@@ -46,18 +66,25 @@ defmodule Ethereumex.WsServer do
       %{state | replies: replies}
     end
 
-    def add_pending_sub(state = %__MODULE__{}, _req_id, nil), do: state
-    def add_pending_sub(state = %__MODULE__{pending_subs: pending_subs}, req_id, sub_pid) do
-      %{state | pending_subs: Map.put(pending_subs, req_id, sub_pid)}
+    def add_pending_sub(state = %__MODULE__{}, _req_id, nil, _params), do: state
+    def add_pending_sub(state = %__MODULE__{pending_subs: pending_subs, sub_params: sub_params}, req_id, sub_pid, params) do
+      %{state |
+        pending_subs: Map.put(pending_subs, req_id, sub_pid),
+        sub_params: Map.put(sub_params, req_id, params)
+      }
     end
 
-    def convert_pending_to_sub(state = %__MODULE__{pending_subs: p_subs, subs: subs}, req_id, sub_id) when is_binary(sub_id) do
+    def convert_pending_to_sub(state = %__MODULE__{pending_subs: p_subs, subs: subs, sub_params: sub_params}, req_id, sub_id) when is_binary(sub_id) do
       case Map.get(p_subs, req_id) do
         nil -> state
-        sub_pid -> %{state |
-          subs: Map.put(subs, sub_id, sub_pid),
-          pending_subs: Map.delete(p_subs, req_id)
-        }
+        sub_pid ->
+          params = Map.get(sub_params, req_id)
+          sub_params = Map.delete(sub_params, req_id)
+          %{state |
+            subs: Map.put(subs, sub_id, sub_pid),
+            pending_subs: Map.delete(p_subs, req_id),
+            sub_params: Map.put(sub_params, sub_id, params)
+          }
       end
     end
     def convert_pending_to_sub(state = %__MODULE__{}, _req_id, _sub_id), do: state
@@ -66,8 +93,8 @@ defmodule Ethereumex.WsServer do
 
     # TODO: when the connection goes down, delete the process
     # TODO: store subscription ids by pid and remove them on disconnect?
-    def remove_sub(state = %__MODULE__{subs: subs}, sub_id) do
-      %{state | subs: Map.delete(subs, sub_id)}
+    def remove_sub(state = %__MODULE__{subs: subs, sub_params: sub_params}, sub_id) do
+      %{state | subs: Map.delete(subs, sub_id), sub_params: Map.delete(sub_params, sub_id)}
     end
   end
 
@@ -92,9 +119,10 @@ defmodule Ethereumex.WsServer do
     state = State.push_reply(state, id, from)
 
     state = case decoded do
-      %{"method" => "eth_subscribe"} ->
+      %{"method" => "eth_subscribe", "params" => params} ->
         # TODO: cleanup pending subs if they don't get processed in some amount of time to avoid potential memory leak
-        State.add_pending_sub(state, id, sub_pid)
+        # TODO: monitor the sub_pid and remove it's subscriptions if the process stops
+        State.add_pending_sub(state, id, sub_pid, params)
       %{"method" => "eth_unsubscribe", "params" => [sub_id]} ->
         State.remove_sub(state, sub_id)
       _ -> state
@@ -112,13 +140,22 @@ defmodule Ethereumex.WsServer do
       %{"method" => "eth_subscription"} ->
         # relay subscription message to subscribing process
         sub_id = State.get_sub(state, get_in(response, ["params", "subscription"]))
-        Logger.debug("relaying subscription message to subsciber: #{inspect(sub_id)} #{json_response}")
-        send(sub_id, response)
+        Logger.debug("relaying subscription message to subscriber: #{inspect(sub_id)} #{json_response}")
+        send(sub_id, {:eth_subscription, response})
         {:noreply, state}
       %{"id" => id, "result" => maybe_sub_id} ->
         # just a standard response or maybe an eth_subscribe response
         {addr, state} = State.pop_reply(state, id)
-        GenServer.reply(addr, {:ok, json_response})
+        if addr != nil do
+          GenServer.reply(addr, {:ok, json_response})
+        else
+          # resub
+          addr = Map.get(state.pending_subs, id)
+          if addr != nil do
+            # notify the subscriber about the resubscribe
+            send(addr, {:resubscribe, response})
+          end
+        end
         {:noreply, State.convert_pending_to_sub(state, id, maybe_sub_id)}
     end
   end
@@ -130,6 +167,26 @@ defmodule Ethereumex.WsServer do
     if addr != nil do
       Logger.warn("timeout exceeded. giving up on reply for #{id} to #{inspect(addr)}")
     end
+
+    {:noreply, state}
+  end
+
+  def handle_info(:socket_connected, state = %State{}) do
+    # resubscribe all the existing subscriptions
+    state = Enum.reduce(state.subs, state, fn {sub_id, sub_pid}, state ->
+      params = Map.get(state.sub_params, sub_id)
+      # TODO: finish implementing this
+
+      req_id = "resub-#{sub_id}"
+      request = %{"id" => req_id, "method" => "eth_subscribe", "params" => params}
+      |> Jason.encode!()
+
+      Socket.send_request(state.socket, request)
+
+      state
+        |> State.remove_sub(sub_id)
+        |> State.add_pending_sub(req_id, sub_pid, params)
+    end)
 
     {:noreply, state}
   end
