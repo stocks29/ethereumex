@@ -1,6 +1,6 @@
 defmodule Ethereumex.Config do
   @moduledoc false
-  alias Ethereumex.IpcServer
+  alias Ethereumex.{IpcServer, WsServer}
 
   def setup_children(), do: setup_children(client_type())
 
@@ -9,6 +9,15 @@ defmodule Ethereumex.Config do
       :poolboy.child_spec(:worker, poolboy_config(),
         path: ipc_path(),
         ipc_request_timeout: ipc_request_timeout()
+      )
+    ]
+  end
+
+  # TODO: do we want/need to use poolboy here? it could make unsubscibing more complicated
+  def setup_children(:ws) do
+    [
+      :poolboy.child_spec(:worker, ws_poolboy_config(),
+        url: rpc_url()
       )
     ]
   end
@@ -88,4 +97,25 @@ defmodule Ethereumex.Config do
   defp http_pool_options() do
     Application.get_env(:ethereumex, :http_pool_options, %{})
   end
+
+  @spec ws_poolboy_config() :: keyword()
+  defp ws_poolboy_config() do
+    [
+      {:name, {:local, :ws_worker}},
+      {:worker_module, WsServer},
+      {:size, ws_worker_size()},
+      {:max_overflow, ws_max_worker_overflow()}
+    ]
+  end
+
+  @spec ws_worker_size() :: integer()
+  defp ws_worker_size() do
+    Application.get_env(:ethereumex, :ws_worker_size, 5)
+  end
+
+  @spec ipc_max_worker_overflow() :: integer()
+  defp ws_max_worker_overflow() do
+    Application.get_env(:ethereumex, :ws_max_worker_overflow, 2)
+  end
+
 end

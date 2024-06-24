@@ -1,3 +1,9 @@
+# This Fork
+
+This is a fork of the Ethereumex project which implements a websocket transport. It is still a work in progress and requires some polish and tests to productionalize. Use at your own risk.
+
+This work was sponsored by [Hawku](https://www.hawku.com/).
+
 # Ethereumex
 
 [![CircleCI](https://circleci.com/gh/mana-ethereum/ethereumex.svg?style=svg)](https://circleci.com/gh/exthereum/ethereumex)
